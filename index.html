@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hand Bubble Bounce</title>
+  </head>
+  <body>
+    <div id="app">
+      <div id="stage">
+        <video id="camera" playsinline autoplay muted></video>
+        <canvas id="game"></canvas>
+      </div>
+
+      <div id="hud">
+        <div class="hud-block left">
+          <div class="label">Score</div>
+          <div id="score" class="value">0</div>
+          <div class="sub">Combo <span id="combo">0</span></div>
+        </div>
+        <div class="hud-block right">
+          <div class="label">AI Pressure</div>
+          <div class="meter">
+            <div id="pressure-fill"></div>
+          </div>
+          <div class="sub"><span id="pressure-pct">0</span>%</div>
+        </div>
+      </div>
+
+      <div id="hint" class="hidden">Move your hands into view</div>
+
+      <div id="start-overlay">
+        <div class="panel">
+          <p class="eyebrow">Endless · Hand-tracked</p>
+          <h1>Bubble Bounce</h1>
+          <p class="tagline">
+            Hit floating bubbles with your fingertips. They bounce. An adaptive
+            opponent learns your patterns and pushes back.
+          </p>
+          <button id="start-btn" type="button">Start</button>
+          <p id="status" class="status"></p>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
