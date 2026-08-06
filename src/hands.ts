@@ -4,26 +4,19 @@ import {
   type NormalizedLandmark,
 } from "@mediapipe/tasks-vision";
 
-const TIP_INDICES = [4, 8, 12, 16, 20] as const;
+/** Index fingertip only */
+const INDEX_TIP = 8;
 
-export type Fingertip = {
+export type FingerPoint = {
   x: number;
   y: number;
   vx: number;
   vy: number;
-  handIndex: number;
-  tipIndex: number;
 };
 
 export type HandsTracker = {
-  detect: (video: HTMLVideoElement, nowMs: number) => Fingertip[];
+  detectIndex: (video: HTMLVideoElement, nowMs: number) => FingerPoint | null;
   close: () => void;
-};
-
-type TipState = {
-  x: number;
-  y: number;
-  t: number;
 };
 
 const WASM_ROOT =
@@ -39,8 +32,8 @@ async function createLandmarker(delegate: "GPU" | "CPU") {
       delegate,
     },
     runningMode: "VIDEO",
-    numHands: 2,
-    minHandDetectionConfidence: 0.5,
+    numHands: 1,
+    minHandDetectionConfidence: 0.55,
     minHandPresenceConfidence: 0.5,
     minTrackingConfidence: 0.5,
   });
@@ -54,63 +47,43 @@ export async function createHandsTracker(): Promise<HandsTracker> {
     landmarker = await createLandmarker("CPU");
   }
 
-  const prev = new Map<string, TipState>();
+  let prev: { x: number; y: number; t: number } | null = null;
   let lastVideoTime = -1;
-  let cached: Fingertip[] = [];
+  let cached: FingerPoint | null = null;
   let lastDetectMs = 0;
   const minDetectInterval = 1000 / 30;
 
-  const detect = (video: HTMLVideoElement, nowMs: number): Fingertip[] => {
-    if (video.readyState < 2) return cached;
-    if (nowMs - lastDetectMs < minDetectInterval && video.currentTime === lastVideoTime) {
-      return cached;
-    }
-    if (video.currentTime === lastVideoTime) return cached;
-
-    lastVideoTime = video.currentTime;
-    lastDetectMs = nowMs;
-
-    const result = landmarker.detectForVideo(video, nowMs);
-    const tips: Fingertip[] = [];
-    const hands = result.landmarks ?? [];
-
-    for (let h = 0; h < hands.length; h++) {
-      const landmarks = hands[h];
-      for (const tipIndex of TIP_INDICES) {
-        const lm = landmarks[tipIndex] as NormalizedLandmark | undefined;
-        if (!lm) continue;
-
-        const key = `${h}:${tipIndex}`;
-        const prevState = prev.get(key);
-        let vx = 0;
-        let vy = 0;
-        if (prevState) {
-          const dt = Math.max((nowMs - prevState.t) / 1000, 1 / 120);
-          vx = (lm.x - prevState.x) / dt;
-          vy = (lm.y - prevState.y) / dt;
-        }
-        prev.set(key, { x: lm.x, y: lm.y, t: nowMs });
-
-        tips.push({
-          x: lm.x,
-          y: lm.y,
-          vx,
-          vy,
-          handIndex: h,
-          tipIndex,
-        });
-      }
-    }
-
-    // Drop stale tip keys when hands leave
-    if (tips.length === 0) prev.clear();
-
-    cached = tips;
-    return tips;
-  };
-
   return {
-    detect,
+    detectIndex: (video, nowMs) => {
+      if (video.readyState < 2) return cached;
+      if (video.currentTime === lastVideoTime) {
+        if (nowMs - lastDetectMs < minDetectInterval) return cached;
+      }
+      if (video.currentTime === lastVideoTime) return cached;
+
+      lastVideoTime = video.currentTime;
+      lastDetectMs = nowMs;
+
+      const result = landmarker.detectForVideo(video, nowMs);
+      const hand = result.landmarks?.[0];
+      if (!hand) {
+        prev = null;
+        cached = null;
+        return null;
+      }
+
+      const lm = hand[INDEX_TIP] as NormalizedLandmark;
+      let vx = 0;
+      let vy = 0;
+      if (prev) {
+        const dt = Math.max((nowMs - prev.t) / 1000, 1 / 120);
+        vx = (lm.x - prev.x) / dt;
+        vy = (lm.y - prev.y) / dt;
+      }
+      prev = { x: lm.x, y: lm.y, t: nowMs };
+      cached = { x: lm.x, y: lm.y, vx, vy };
+      return cached;
+    },
     close: () => landmarker.close(),
   };
 }

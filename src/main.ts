@@ -2,19 +2,38 @@ import "./styles.css";
 import {
   startCamera,
   mapMirroredCoverPoint,
-  canvasToNormMirrored,
   type CameraHandle,
 } from "./camera";
-import { createHandsTracker, type HandsTracker, type Fingertip } from "./hands";
-import { createBubble, stepBubbles, type Bubble } from "./game/bubbles";
-import { resolveCollisions, nearMiss } from "./game/collision";
-import { createScoreState, registerHit, tickComboDecay } from "./game/score";
+import { createHandsTracker, type HandsTracker } from "./hands";
+import {
+  cellCenter,
+  createInitialGrid,
+  findSlotNear,
+  insertBall,
+  lowestBallY,
+  markMatchesAndFalls,
+  pushNewRow,
+  type GridBall,
+  type GridConfig,
+} from "./game/grid";
+import {
+  clearAim,
+  createShooter,
+  layoutShooter,
+  stepShot,
+  stopShot,
+  tryShoot,
+  updateAimFromFinger,
+  type Shooter,
+} from "./game/shooter";
+import { createScoreState, registerPop, tickComboDecay } from "./game/score";
 import { createAdaptiveAI } from "./game/adaptiveAI";
 import {
   clearCanvas,
-  drawBubbles,
-  drawFingertips,
-  drawHitRipples,
+  drawDangerLine,
+  drawGrid,
+  drawIndexFinger,
+  drawShooter,
 } from "./game/render";
 
 const video = document.querySelector<HTMLVideoElement>("#camera")!;
@@ -34,20 +53,21 @@ let camera: CameraHandle | null = null;
 let hands: HandsTracker | null = null;
 let running = false;
 let visible = true;
+let gameOver = false;
 
-const bubbles: Bubble[] = [];
+let cfg: GridConfig;
+let balls: Map<string, GridBall>;
+let shooter: Shooter;
 const score = createScoreState();
 const ai = createAdaptiveAI();
-const ripples: { x: number; y: number; age: number }[] = [];
 
 let lastTs = 0;
-let lastSpawnAt = 0;
 let lastHudAt = 0;
 let lastHandSeenAt = 0;
-let approachScore = 0;
-let hitScore = 0;
-let reactionSamples: number[] = [];
+let lastRowDropAt = 0;
 let lastAiUpdate = 0;
+let wasGrabbing = false;
+let grabFrames = 0;
 
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -58,6 +78,15 @@ function resize() {
   canvas.style.width = `${w}px`;
   canvas.style.height = `${h}px`;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  if (shooter && cfg) {
+    const radius = Math.min(28, (w * 0.86) / (cfg.cols * 2));
+    cfg.radius = radius;
+    const gridWidth = radius * 2 * 0.92 * (cfg.cols - 1) + radius * 2;
+    cfg.originX = (w - gridWidth) / 2 + radius;
+    cfg.originY = radius * 1.6 + 12;
+    layoutShooter(shooter, w, h, radius);
+  }
 }
 
 function setStatus(msg: string) {
@@ -71,11 +100,11 @@ function canvasSize() {
   };
 }
 
-function tipToCanvas(tip: Fingertip) {
+function fingerToCanvas(nx: number, ny: number) {
   const { w, h } = canvasSize();
   return mapMirroredCoverPoint(
-    tip.x,
-    tip.y,
+    nx,
+    ny,
     video.videoWidth,
     video.videoHeight,
     w,
@@ -83,27 +112,8 @@ function tipToCanvas(tip: Fingertip) {
   );
 }
 
-function toNorm(x: number, y: number) {
-  const { w, h } = canvasSize();
-  return canvasToNormMirrored(
-    x,
-    y,
-    video.videoWidth,
-    video.videoHeight,
-    w,
-    h,
-  );
-}
-
-function spawnBubble(now: number) {
-  const { w, h } = canvasSize();
-  const { nx, ny } = ai.pickSpawnNorm();
-  const r = ai.bubbleRadius(Math.min(w, h));
-  const speed = ai.bubbleSpeed();
-  const x = Math.min(w - r - 8, Math.max(r + 8, nx * w));
-  const y = Math.min(h - r - 8, Math.max(r + 8, ny * h));
-  bubbles.push(createBubble(x, y, r, speed, now));
-  lastSpawnAt = now;
+function dangerLineY(h: number, radius: number) {
+  return h - radius * 5.5;
 }
 
 function updateHud(now: number) {
@@ -116,7 +126,7 @@ function updateHud(now: number) {
   pressurePct.textContent = String(p);
 }
 
-function playHitBeep() {
+function playPop() {
   try {
     const Ctx =
       window.AudioContext ||
@@ -125,162 +135,233 @@ function playHitBeep() {
     const ac = new Ctx();
     const o = ac.createOscillator();
     const g = ac.createGain();
-    o.type = "sine";
-    o.frequency.value = 520 + Math.random() * 180;
-    g.gain.value = 0.04;
+    o.type = "triangle";
+    o.frequency.value = 380 + Math.random() * 120;
+    g.gain.value = 0.05;
     o.connect(g);
     g.connect(ac.destination);
     o.start();
-    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.08);
-    o.stop(ac.currentTime + 0.09);
+    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.12);
+    o.stop(ac.currentTime + 0.13);
     o.onended = () => void ac.close();
   } catch {
-    // audio optional
+    /* optional */
   }
+}
+
+function attachShot(now: number) {
+  if (!shooter.shot) return;
+  const shot = shooter.shot;
+  const slot = findSlotNear(cfg, balls, shot.x, shot.y);
+  if (!slot) {
+    const col = Math.max(
+      0,
+      Math.min(
+        cfg.cols - 1,
+        Math.round((shot.x - cfg.originX) / (cfg.radius * 2 * 0.92)),
+      ),
+    );
+    insertBall(balls, 0, col, shot.color);
+    stopShot(shooter);
+    finishAttach(markMatchesAndFalls(balls, 0, col), now);
+    return;
+  }
+  insertBall(balls, slot.row, slot.col, shot.color);
+  stopShot(shooter);
+  finishAttach(markMatchesAndFalls(balls, slot.row, slot.col), now);
+}
+
+function finishAttach(
+  result: { popped: number; dropped: number },
+  now: number,
+) {
+  ai.recordShotResult(result.popped);
+  if (result.popped > 0 || result.dropped > 0) {
+    registerPop(score, result.popped, result.dropped, now);
+    playPop();
+  }
+}
+
+function collideWithGrid(): boolean {
+  const shot = shooter.shot;
+  if (!shot?.active) return false;
+  for (const b of balls.values()) {
+    if (b.falling || b.popping > 0) continue;
+    const p = cellCenter(cfg, b.row, b.col);
+    if (Math.hypot(shot.x - p.x, shot.y - p.y) < cfg.radius * 1.85) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stepAnimations(dt: number, height: number) {
+  const remove: string[] = [];
+  for (const [k, b] of balls) {
+    if (b.popping > 0) {
+      b.popping += dt * 3.2;
+      if (b.popping >= 1) remove.push(k);
+    } else if (b.falling) {
+      b.fallVy += 900 * dt;
+      b.fallY += b.fallVy * dt;
+      const p = cellCenter(cfg, b.row, b.col);
+      if (p.y + b.fallY > height + 80) remove.push(k);
+    }
+  }
+  for (const k of remove) balls.delete(k);
+}
+
+function resetGame() {
+  const { w, h } = canvasSize();
+  const init = createInitialGrid(w, h, 5, ai.maxColors());
+  cfg = init.cfg;
+  balls = init.balls;
+  shooter = createShooter(w, h, cfg.radius, ai.maxColors());
+  score.score = 0;
+  score.combo = 0;
+  gameOver = false;
+  lastRowDropAt = performance.now();
+  hintEl.textContent = "Point with your index finger to aim · flick up to shoot";
 }
 
 function frame(ts: number) {
   if (!running) return;
   requestAnimationFrame(frame);
-
   if (!visible || !hands || !camera) return;
 
   const now = performance.now();
   const dt = Math.min(0.05, (ts - lastTs) / 1000 || 0.016);
   lastTs = ts;
-
   const { w, h } = canvasSize();
+
   clearCanvas(ctx, w, h);
 
-  const rawTips = hands.detect(video, now);
-  const tipDraw = rawTips.map((tip) => {
-    const p = tipToCanvas(tip);
-    return { tip, x: p.x, y: p.y, vx: tip.vx, vy: tip.vy };
-  });
-
-  if (tipDraw.length > 0) {
+  const finger = hands.detectIndex(video, now);
+  let fingerPos: { x: number; y: number; vx: number; vy: number } | null = null;
+  if (finger) {
+    const p = fingerToCanvas(finger.x, finger.y);
+    // Mirror velocity X to match mirrored canvas
+    fingerPos = { x: p.x, y: p.y, vx: -finger.vx, vy: finger.vy };
     lastHandSeenAt = now;
     hintEl.classList.add("hidden");
-    for (const t of tipDraw) {
-      const n = toNorm(t.x, t.y);
-      ai.recordPresence(n.nx, n.ny, dt * 8);
-    }
-  } else if (now - lastHandSeenAt > 1200) {
+  } else if (now - lastHandSeenAt > 1200 && !gameOver) {
     hintEl.classList.remove("hidden");
   }
 
-  const maxB = ai.maxBubbles();
-  if (
-    bubbles.filter((b) => b.alive).length < maxB &&
-    now - lastSpawnAt >= ai.spawnIntervalMs()
-  ) {
-    spawnBubble(now);
-  }
+  const dangerY = dangerLineY(h, cfg.radius);
+  const grabZoneY = h * 0.55;
 
-  let dodge: { x: number; y: number; strength: number } | null = null;
-  const dodgeStr = ai.dodgeStrength();
-  if (dodgeStr > 0 && tipDraw.length > 0) {
-    let sx = 0;
-    let sy = 0;
-    for (const t of tipDraw) {
-      sx += t.x;
-      sy += t.y;
-    }
-    dodge = { x: sx / tipDraw.length, y: sy / tipDraw.length, strength: dodgeStr };
-  }
+  if (!gameOver && !shooter.shot?.active) {
+    if (fingerPos) {
+      const inGrabZone = fingerPos.y > grabZoneY;
+      const nearShooter =
+        Math.hypot(fingerPos.x - shooter.x, fingerPos.y - shooter.y) <
+        cfg.radius * 8;
 
-  stepBubbles(bubbles, dt, w, h, dodge);
+      if (inGrabZone || nearShooter || wasGrabbing) {
+        updateAimFromFinger(shooter, fingerPos.x, fingerPos.y);
+        grabFrames += 1;
+        wasGrabbing = true;
 
-  for (const b of bubbles) {
-    if (!b.alive) continue;
-    for (const t of tipDraw) {
-      if (nearMiss(b, t.x, t.y, 2.4)) {
-        approachScore += dt;
-        if (
-          now - b.lastHitAt > 400 &&
-          Math.hypot(b.x - t.x, b.y - t.y) > b.r + 8
-        ) {
-          const n = toNorm(b.x, b.y);
-          if (Math.random() < dt * 2) ai.recordMissApproach(n.nx, n.ny);
+        // Flick up (negative vy in image space) to shoot
+        if (grabFrames > 5 && fingerPos.vy < -0.6) {
+          tryShoot(shooter, now, 780, ai.maxColors());
+          wasGrabbing = false;
+          grabFrames = 0;
+          clearAim(shooter);
         }
+      } else if (wasGrabbing && grabFrames > 8) {
+        // Released aim by moving away — shoot on release
+        tryShoot(shooter, now, 780, ai.maxColors());
+        wasGrabbing = false;
+        grabFrames = 0;
+        clearAim(shooter);
+      } else {
+        wasGrabbing = false;
+        grabFrames = 0;
+        clearAim(shooter);
       }
+    } else if (wasGrabbing && grabFrames > 8) {
+      tryShoot(shooter, now, 780, ai.maxColors());
+      wasGrabbing = false;
+      grabFrames = 0;
+      clearAim(shooter);
+    } else {
+      wasGrabbing = false;
+      grabFrames = 0;
+      clearAim(shooter);
     }
   }
 
-  const hitEvents = resolveCollisions(bubbles, tipDraw, now);
-
-  for (const hit of hitEvents) {
-    hitScore += 1;
-    const reaction = now - hit.bubble.spawnedAt;
-    reactionSamples.push(reaction);
-    if (reactionSamples.length > 25) reactionSamples.shift();
-    const n = toNorm(hit.canvasX, hit.canvasY);
-    ai.recordHit(n.nx, n.ny, reaction);
-    registerHit(score, now);
-    ripples.push({ x: hit.canvasX, y: hit.canvasY, age: 0 });
-    playHitBeep();
+  if (!gameOver && shooter.shot?.active) {
+    const status = stepShot(shooter, dt, w, cfg.originY - cfg.radius);
+    if (status === "hit-ceiling" || collideWithGrid()) {
+      attachShot(now);
+    }
+    // Lost off bottom (shouldn't happen often)
+    if (shooter.shot && shooter.shot.y > h + 40) stopShot(shooter);
   }
 
-  tickComboDecay(score, now);
+  stepAnimations(dt, h);
+
+  // Adaptive row drops
+  if (!gameOver && now - lastRowDropAt > ai.rowDropIntervalMs()) {
+    pushNewRow(balls, cfg, ai.maxColors());
+    lastRowDropAt = now;
+  }
+
+  // Game over if cluster crosses danger line
+  if (!gameOver && lowestBallY(cfg, balls) + cfg.radius > dangerY) {
+    gameOver = true;
+    hintEl.classList.add("hidden");
+    overlay.classList.remove("hidden");
+    startBtn.disabled = false;
+    startBtn.textContent = "Play again";
+    setStatus(`Game over · Score ${score.score}`);
+  }
 
   if (now - lastAiUpdate > 500) {
     const elapsed = (now - lastAiUpdate) / 1000;
     lastAiUpdate = now;
-    const hitRate =
-      approachScore > 0.01
-        ? Math.min(1, hitScore / (approachScore * 3 + hitScore))
-        : 0.45;
-    approachScore *= 0.55;
-    hitScore *= 0.55;
-    const meanReaction =
-      reactionSamples.length > 0
-        ? reactionSamples.reduce((a, b) => a + b, 0) / reactionSamples.length
-        : 900;
-    const idleSec = score.lastHitAt === 0 ? 0 : (now - score.lastHitAt) / 1000;
+    const danger =
+      (lowestBallY(cfg, balls) - cfg.originY) / Math.max(1, dangerY - cfg.originY);
     ai.update(elapsed, {
-      hitRate,
-      meanReactionMs: meanReaction,
-      idleSec,
-      combo: score.combo,
+      idleSec: score.lastPopAt === 0 ? 0 : (now - score.lastPopAt) / 1000,
+      danger: Math.min(1, Math.max(0, danger)),
     });
   }
 
-  for (const r of ripples) r.age += dt * 2.5;
-  for (let i = ripples.length - 1; i >= 0; i--) {
-    if (ripples[i].age >= 1) ripples.splice(i, 1);
+  tickComboDecay(score, now);
+
+  drawDangerLine(ctx, dangerY, w);
+  drawGrid(ctx, cfg, balls);
+  drawShooter(ctx, shooter);
+  if (fingerPos) {
+    drawIndexFinger(ctx, fingerPos.x, fingerPos.y, Boolean(shooter.aiming));
   }
 
-  drawBubbles(ctx, bubbles);
-  drawHitRipples(ctx, ripples);
-  drawFingertips(
-    ctx,
-    tipDraw.map((t) => ({ x: t.x, y: t.y })),
-  );
   updateHud(now);
 }
 
 async function startGame() {
   startBtn.disabled = true;
   setStatus("Requesting camera…");
-
   try {
     camera = await startCamera(video);
     setStatus("Loading hand tracker…");
     hands = await createHandsTracker();
     setStatus("");
     overlay.classList.add("hidden");
+    resize();
+    resetGame();
     running = true;
     lastTs = performance.now();
-    lastSpawnAt = performance.now();
     lastAiUpdate = performance.now();
     lastHandSeenAt = performance.now();
-    spawnBubble(performance.now());
     requestAnimationFrame(frame);
   } catch (err) {
     console.error(err);
-    const message =
-      err instanceof Error ? err.message : "Could not start camera or tracker";
-    setStatus(message);
+    setStatus(err instanceof Error ? err.message : "Could not start");
     startBtn.disabled = false;
   }
 }
@@ -290,5 +371,15 @@ document.addEventListener("visibilitychange", () => {
   visible = document.visibilityState === "visible";
 });
 
-startBtn.addEventListener("click", () => void startGame());
+startBtn.addEventListener("click", () => {
+  if (running) {
+    resetGame();
+    overlay.classList.add("hidden");
+    startBtn.textContent = "Start";
+    setStatus("");
+    return;
+  }
+  void startGame();
+});
+
 resize();
